@@ -48,14 +48,16 @@ std::string String(JNIEnv* env, jstring value) {
 struct Session;
 using android_controller::VideoPicture;
 void RenderVideo(Session* s, VideoPicture picture);
-struct CallbackContext { Session* owner; bool controller; };
+struct CallbackContext { Session* owner; bool controller; bool host = false; };
 struct Session {
   jobject owner = nullptr;
   jmethodID event_method, audio_method, frame_method;
   mobile_controller::DirectConnection direct;
   MiniRtcPeerPtr* identity = nullptr;
   MiniRtcPeerPtr* controller = nullptr;
+  MiniRtcPeerPtr* host_peer = nullptr;
   CallbackContext identity_context{this, false}, controller_context{this, true};
+  CallbackContext host_context{this, false, true};
   std::string host, log_path, identity_login, controller_login, remote;
   std::unique_ptr<mobile_controller::DeviceTrustIdentity> trust;
   int port;
@@ -106,6 +108,67 @@ struct Session {
     if (controller && !stopping && !data.empty())
       MiniRtcSendReliableDataFrame(controller, data.data(), data.size(), stream);
   }
+  // ---- Android host (controlled device) support ----
+  // A third peer logs in as "deviceId@hostPassword" and accepts one inbound
+  // session, mirroring the desktop host and the synthetic-host fixture.
+  std::string host_login, host_name;
+  int host_width = 0, host_height = 0;
+  std::atomic<bool> host_connected{false};
+  std::mutex host_mutex;
+  std::string host_remote;
+  std::vector<uint8_t> host_nv12;
+  uint64_t host_last_frame_us = 0;
+  bool HostSend(const char* stream, const std::string& data) {
+    return host_peer && !stopping && !data.empty() &&
+           MiniRtcSendReliableDataFrame(host_peer, data.data(), data.size(), stream) == 0;
+  }
+  void SendHostInformation() {
+    if (!host_peer) return;
+    auto info = MakeHostInformation(
+        host_name.empty() ? "CrossDesk Android" : host_name,
+        {{"Display1", 0, 0, host_width, host_height}}, false, "1.6.0",
+        HostPlatform::Android);
+    info.i.supports_text_input = true;
+    info.i.supports_video_settings = true;
+    info.i.supports_video_codec_status = true;
+    HostSend(kControlStream, info.to_json());
+    FreeRemoteAction(info);
+  }
+  void OnHostConnection(MiniRtcConnectionStatus status, const std::string& remote) {
+    if (status == MiniRtcConnectionConnected) {
+      { std::lock_guard<std::mutex> lock(host_mutex); host_remote = remote; }
+      host_connected = true;
+      SendHostInformation();
+      Event(21, {{"remote", remote}});
+    } else if (status == MiniRtcConnectionClosed ||
+               status == MiniRtcConnectionDisconnected ||
+               status == MiniRtcConnectionFailed) {
+      host_connected = false;
+      { std::lock_guard<std::mutex> lock(host_mutex); host_remote.clear(); }
+      Event(22, {{"status", static_cast<int>(status)}});
+    }
+  }
+  void OnHostData(const char* data, size_t size, const char* stream, size_t stream_size) {
+    const std::string name(stream, stream_size);
+    if (name == kClipboardStream) { Event(6, data, size); return; }
+    if (name == kMouseStream || name == kKeyboardStream) { Event(24, data, size); return; }
+    if (name != kControlStream) return;  // File transfer to the host is not wired up yet.
+    RemoteAction action{};
+    if (!action.from_json(std::string(data, size))) return;
+    if (action.type == video_settings) {
+      RemoteAction reply{};
+      reply.type = video_settings_status;
+      reply.vs = action.vs;
+      reply.vs.accepted = true;
+      HostSend(kControlStream, reply.to_json());
+      Event(25, data, size);  // Java adjusts the capture frame rate.
+    } else if (action.type == host_infomation) {
+      SendHostInformation();
+    } else {
+      Event(25, data, size);
+    }
+    FreeRemoteAction(action);
+  }
   void Surface(JNIEnv* env, jobject surface) {
     std::lock_guard<std::mutex> lock(render_mutex);
     ++video_generation;
@@ -117,6 +180,13 @@ struct Session {
     width = height = 0;
   }
   ~Session() {
+    if (host_peer) {
+      host_connected = false;
+      std::string remote;
+      { std::lock_guard<std::mutex> lock(host_mutex); remote = host_remote; }
+      if (!remote.empty()) MiniRtcLeaveConnection(host_peer, remote.c_str());
+      MiniRtcDestroyPeer(&host_peer);
+    }
     // API calls and destruction share the Java RTC executor. Release any
     // delivered input even when queued Java key-up events were cancelled.
     if (controller) {
@@ -148,6 +218,7 @@ struct Session {
 
 void Signal(MiniRtcSignalStatus status, const char*, size_t, void* user) {
   auto* ctx = static_cast<CallbackContext*>(user);
+  if (ctx->host) { ctx->owner->Event(20, {{"status", status}}); return; }
   if (!ctx->controller && status == MiniRtcSignalStatus::MiniRtcSignalConnected &&
       !ctx->owner->stopping && ctx->owner->identity) {
     // Report after every identity login, including reconnects. The server
@@ -174,13 +245,24 @@ void SignalMessage(const char* data, size_t size, void* user) {
     ctx->owner->Event(9, message);
   }
 }
-void Connection(MiniRtcConnectionStatus status, const char*, size_t, void* user) {
+void Connection(MiniRtcConnectionStatus status, const char* remote, size_t remote_size, void* user) {
   auto* ctx = static_cast<CallbackContext*>(user);
+  if (ctx->host) {
+    ctx->owner->OnHostConnection(
+        status, remote ? std::string(remote, remote_size) : std::string());
+    return;
+  }
   if (ctx->controller && !ctx->owner->direct.Status(status)) ctx->owner->Event(2, {{"status", status}});
 }
 void Network(const char* id, size_t size, MiniRtcTraversalMode mode,
              const MiniRtcNetTrafficStats* stats, const char*, size_t, void* user) {
   auto* ctx = static_cast<CallbackContext*>(user);
+  if (ctx->host) {
+    // Never route this through Event(3): that would overwrite the stored
+    // identity credential with the host login, which embeds the password.
+    if (mode == MiniRtcTraversalUnknown && id && size) ctx->owner->Event(23, id, size);
+    return;
+  }
   if (!ctx->controller && mode == MiniRtcTraversalUnknown && id && size) {
     ctx->owner->Event(3, id, size);
   } else if (ctx->controller && stats) {
@@ -190,6 +272,11 @@ void Network(const char* id, size_t size, MiniRtcTraversalMode mode,
 void Data(const char* data, size_t size, const char*, size_t,
           const char* stream, size_t stream_size, void* user) {
   auto* ctx = static_cast<CallbackContext*>(user);
+  if (ctx->host) {
+    if (data && stream && size <= kMaxClipboardBytes)
+      ctx->owner->OnHostData(data, size, stream, stream_size);
+    return;
+  }
   if (!ctx->controller || !data || !stream || size > kMaxClipboardBytes) return;
   const std::string name(stream, stream_size);
   if (name == kFileStream) { ctx->owner->files.Receive(data, size); return; }
@@ -290,6 +377,13 @@ MiniRtcParams Parameters(Session* s, bool controller) {
   p.on_receive_video_frame = Video; p.on_receive_audio_buffer = Audio;
   p.user_id = (controller ? s->controller_login : s->identity_login).c_str();
   p.user_data = controller ? &s->controller_context : &s->identity_context;
+  return p;
+}
+MiniRtcParams HostParameters(Session* s) {
+  MiniRtcParams p = Parameters(s, false);
+  p.user_id = s->host_login.c_str();
+  p.user_data = &s->host_context;
+  p.native_video_output = false;
   return p;
 }
 Session* From(jlong handle) { return reinterpret_cast<Session*>(handle); }
@@ -564,5 +658,80 @@ extern "C" JNIEXPORT void JNICALL JNI_METHOD(nSurface)(JNIEnv* env, jclass, jlon
     if (surface && s->controller && !s->stopping)
       MiniRtcRequestVideoKeyFrame(s->controller, MakeDisplayStreamId(s->display.load()).c_str());
   }
+}
+extern "C" JNIEXPORT jboolean JNICALL JNI_METHOD(nHostStart)(
+    JNIEnv* env, jclass, jlong handle, jstring login, jstring name, jint width, jint height) {
+  auto* s = From(handle);
+  if (!s || s->stopping) return false;
+  if (s->host_peer) return true;
+  s->host_login = String(env, login);
+  s->host_name = String(env, name);
+  s->host_width = width;
+  s->host_height = height;
+  if (s->host_login.empty() || width <= 0 || height <= 0) return false;
+  auto params = HostParameters(s);
+  s->host_peer = MiniRtcCreatePeer(&params);
+  if (!s->host_peer) return false;
+  MiniRtcAddVideoStream(s->host_peer, MakeDisplayStreamId(0).c_str());
+  MiniRtcAddAudioStream(s->host_peer, kAudioStream);
+  MiniRtcAddDataStream(s->host_peer, kDataStream, false);
+  for (const char* stream : {kMouseStream, kKeyboardStream, kControlStream,
+                             kClipboardStream, kFileStream, kFileFeedbackStream})
+    MiniRtcAddDataStream(s->host_peer, stream, true);
+  if (MiniRtcInit(s->host_peer) != 0) {
+    MiniRtcDestroyPeer(&s->host_peer);
+    return false;
+  }
+  return true;
+}
+extern "C" JNIEXPORT void JNICALL JNI_METHOD(nHostStop)(JNIEnv*, jclass, jlong handle) {
+  auto* s = From(handle);
+  if (!s || !s->host_peer) return;
+  s->host_connected = false;
+  std::string remote;
+  { std::lock_guard<std::mutex> lock(s->host_mutex); remote = s->host_remote; s->host_remote.clear(); }
+  if (!remote.empty()) MiniRtcLeaveConnection(s->host_peer, remote.c_str());
+  MiniRtcDestroyPeer(&s->host_peer);
+}
+extern "C" JNIEXPORT jboolean JNICALL JNI_METHOD(nHostFrame)(
+    JNIEnv* env, jclass, jlong handle, jbyteArray rgba, jint width, jint height, jint stride) {
+  auto* s = From(handle);
+  if (!s || !s->host_peer || !s->host_connected || !rgba || s->stopping) return false;
+  const int w = width & ~1, h = height & ~1;  // MiniRTC CPU frames need even dimensions.
+  if (w <= 0 || h <= 0 || stride < w * 4) return false;
+  const auto length = env->GetArrayLength(rgba);
+  if (length < static_cast<jsize>(static_cast<size_t>(stride) * static_cast<size_t>(height)))
+    return false;
+  const uint64_t now = MiniRtcGetSystemTimeMicros(s->host_peer);
+  std::lock_guard<std::mutex> lock(s->host_mutex);
+  if (now - s->host_last_frame_us < 33333) return true;  // ~30 fps cap; a drop is not an error.
+  std::vector<uint8_t> pixels(static_cast<size_t>(length));
+  env->GetByteArrayRegion(rgba, 0, length, reinterpret_cast<jbyte*>(pixels.data()));
+  if (env->ExceptionCheck()) { env->ExceptionClear(); return false; }
+  s->host_last_frame_us = now;
+  s->host_nv12.resize(static_cast<size_t>(w) * static_cast<size_t>(h) * 3 / 2);
+  uint8_t* y_plane = s->host_nv12.data();
+  uint8_t* uv_plane = y_plane + static_cast<size_t>(w) * static_cast<size_t>(h);
+  // RGBA_8888 memory order (R,G,B,A) is libyuv's ABGR layout.
+  if (libyuv::ABGRToNV12(pixels.data(), stride, y_plane, w, uv_plane, w, w, h) != 0)
+    return false;
+  MiniRtcVideoFrame frame{};
+  frame.data = reinterpret_cast<const char*>(s->host_nv12.data());
+  frame.size = s->host_nv12.size();
+  frame.width = static_cast<uint32_t>(w);
+  frame.height = static_cast<uint32_t>(h);
+  frame.captured_timestamp = now;
+  return MiniRtcSendVideoFrame(s->host_peer, &frame, MakeDisplayStreamId(0).c_str()) == 0;
+}
+extern "C" JNIEXPORT jboolean JNICALL JNI_METHOD(nHostClipboard)(
+    JNIEnv* env, jclass, jlong handle, jbyteArray data) {
+  auto* s = From(handle);
+  if (!s || !s->host_peer || !s->host_connected || !data) return false;
+  const auto size = env->GetArrayLength(data);
+  if (!size || size > static_cast<int>(kMaxClipboardBytes)) return false;
+  std::string bytes(static_cast<size_t>(size), '\0');
+  env->GetByteArrayRegion(data, 0, size, reinterpret_cast<jbyte*>(bytes.data()));
+  if (env->ExceptionCheck() || bytes.find('\0') != std::string::npos) return false;
+  return s->HostSend(kClipboardStream, bytes);
 }
 extern "C" JNIEXPORT void JNICALL JNI_METHOD(nDestroy)(JNIEnv*, jclass, jlong handle) { delete From(handle); }
