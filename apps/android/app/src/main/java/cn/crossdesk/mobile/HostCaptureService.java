@@ -29,6 +29,14 @@ import java.nio.ByteBuffer;
  * foreground service; the projection consent result must be supplied by
  * HostActivity, and on Android 14+ consent is needed again after every
  * process restart — the service simply stays stopped until then.
+ *
+ * Startup order matters on Android 14+: the system refuses
+ * startForeground(FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION) with a
+ * SecurityException when no MediaProjection exists yet, so the projection
+ * is created (and its callback registered) BEFORE startForeground is
+ * called. Any setup failure is recorded in the "hostCaptureError"
+ * preference and stops the service instead of crashing the whole app, so
+ * the host panel can show what went wrong on devices without adb access.
  */
 final class HostCaptureService extends Service {
     static final String EXTRA_RESULT_CODE = "resultCode";
@@ -57,56 +65,87 @@ final class HostCaptureService extends Service {
             manager.createNotificationChannel(new NotificationChannel(
                     CHANNEL_ID, "CrossDesk 投屏", NotificationManager.IMPORTANCE_LOW));
         }
-        Notification notification = new Notification.Builder(this, CHANNEL_ID)
-                .setContentTitle("CrossDesk 正在共享屏幕")
-                .setContentText("远程控制会话可见到本机画面")
-                .setSmallIcon(getApplicationInfo().icon)
-                .setOngoing(true)
-                .build();
-        if (Build.VERSION.SDK_INT >= 29) {
-            startForeground(NOTIFICATION_ID, notification,
-                    ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION);
-        } else {
-            startForeground(NOTIFICATION_ID, notification);
-        }
         thread = new HandlerThread("crossdesk-host-capture");
         thread.start();
         handler = new Handler(thread.getLooper());
     }
 
+    private Notification buildNotification() {
+        return new Notification.Builder(this, CHANNEL_ID)
+                .setContentTitle("CrossDesk 正在共享屏幕")
+                .setContentText("远程控制会话可见到本机画面")
+                .setSmallIcon(getApplicationInfo().icon)
+                .setOngoing(true)
+                .build();
+    }
+
+    private void startForegroundWithType() {
+        if (Build.VERSION.SDK_INT >= 29) {
+            startForeground(NOTIFICATION_ID, buildNotification(),
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION);
+        } else {
+            startForeground(NOTIFICATION_ID, buildNotification());
+        }
+    }
+
+    private void recordError(Throwable error) {
+        String message = error.getClass().getSimpleName()
+                + (error.getMessage() != null ? ": " + error.getMessage() : "");
+        getSharedPreferences("settings", MODE_PRIVATE).edit()
+                .putString("hostCaptureError", message).apply();
+    }
+
+    static void clearError(android.content.Context context) {
+        context.getSharedPreferences("settings", MODE_PRIVATE).edit()
+                .remove("hostCaptureError").apply();
+    }
+
     @Override public int onStartCommand(Intent intent, int flags, int startId) {
-        if (intent == null || running) return START_NOT_STICKY;
+        if (running) return START_STICKY;
+        if (intent == null) { stopSelf(); return START_NOT_STICKY; }
         int resultCode = intent.getIntExtra(EXTRA_RESULT_CODE, 0);
         Intent data = intent.getParcelableExtra(EXTRA_DATA);
         if (resultCode != android.app.Activity.RESULT_OK || data == null) {
+            recordError(new IllegalStateException("投屏授权结果无效"));
             stopSelf();
             return START_NOT_STICKY;
         }
-        MediaProjectionManager manager =
-                (MediaProjectionManager) getSystemService(MEDIA_PROJECTION_SERVICE);
-        if (manager == null) { stopSelf(); return START_NOT_STICKY; }
-        projection = manager.getMediaProjection(resultCode, data);
-        // Android 14+ requires a registered callback before createVirtualDisplay.
-        projection.registerCallback(new MediaProjection.Callback() {
-            @Override public void onStop() { stopSelf(); }
-        }, handler);
+        try {
+            MediaProjectionManager manager =
+                    (MediaProjectionManager) getSystemService(MEDIA_PROJECTION_SERVICE);
+            if (manager == null) throw new IllegalStateException("无 MediaProjection 服务");
+            // Android 14+: a MediaProjection must exist (with a registered
+            // callback) before the mediaProjection foreground service may
+            // call startForeground, and before createVirtualDisplay.
+            projection = manager.getMediaProjection(resultCode, data);
+            projection.registerCallback(new MediaProjection.Callback() {
+                @Override public void onStop() { stopSelf(); }
+            }, handler);
+            startForegroundWithType();
 
-        WindowManager wm = (WindowManager) getSystemService(WINDOW_SERVICE);
-        Display display = wm.getDefaultDisplay();
-        Point size = new Point();
-        display.getRealSize(size);
-        DisplayMetrics metrics = new DisplayMetrics();
-        display.getRealMetrics(metrics);
+            WindowManager wm = (WindowManager) getSystemService(WINDOW_SERVICE);
+            Display display = wm.getDefaultDisplay();
+            Point size = new Point();
+            display.getRealSize(size);
+            DisplayMetrics metrics = new DisplayMetrics();
+            display.getRealMetrics(metrics);
 
-        reader = ImageReader.newInstance(size.x, size.y, PixelFormat.RGBA_8888, 2);
-        reader.setOnImageAvailableListener(this::onImage, handler);
-        virtualDisplay = projection.createVirtualDisplay(
-                "CrossDeskHost", size.x, size.y, metrics.densityDpi,
-                DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
-                reader.getSurface(), null, handler);
-        running = true;
-        startSystemAudio();
-        return START_STICKY;
+            reader = ImageReader.newInstance(size.x, size.y, PixelFormat.RGBA_8888, 2);
+            reader.setOnImageAvailableListener(this::onImage, handler);
+            virtualDisplay = projection.createVirtualDisplay(
+                    "CrossDeskHost", size.x, size.y, metrics.densityDpi,
+                    DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
+                    reader.getSurface(), null, handler);
+            running = true;
+            clearError(this);
+            startSystemAudio();
+            return START_STICKY;
+        } catch (Exception error) {
+            recordError(error);
+            cleanupCapture();
+            stopSelf();
+            return START_NOT_STICKY;
+        }
     }
 
     /**
@@ -120,7 +159,9 @@ final class HostCaptureService extends Service {
         boolean granted = checkSelfPermission(android.Manifest.permission.RECORD_AUDIO)
                 == android.content.pm.PackageManager.PERMISSION_GRANTED;
         if (!enabled || !granted) return;
-        systemAudio.startSystem(projection, HostService::pushAudioFrame);
+        try {
+            systemAudio.startSystem(projection, HostService::pushAudioFrame);
+        } catch (Exception ignored) { }
     }
 
     private void onImage(ImageReader imageReader) {
@@ -159,17 +200,23 @@ final class HostCaptureService extends Service {
                 }
             }
             HostService.pushFrame(frame, width, height, width * 4);
+        } catch (Exception ignored) {
+            // A malformed frame must never take the capture thread down.
         } finally {
             image.close();
         }
     }
 
+    private void cleanupCapture() {
+        systemAudio.stop();
+        if (virtualDisplay != null) { virtualDisplay.release(); virtualDisplay = null; }
+        if (reader != null) { reader.close(); reader = null; }
+        if (projection != null) { projection.stop(); projection = null; }
+    }
+
     @Override public void onDestroy() {
         running = false;
-        systemAudio.stop();
-        if (virtualDisplay != null) virtualDisplay.release();
-        if (reader != null) reader.close();
-        if (projection != null) projection.stop();
+        cleanupCapture();
         if (thread != null) thread.quitSafely();
         super.onDestroy();
     }

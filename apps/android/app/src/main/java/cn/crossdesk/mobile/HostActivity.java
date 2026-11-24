@@ -139,7 +139,14 @@ public final class HostActivity extends Activity implements HostService.Observer
         idView.setText("本机 ID：" + (service != null && !service.deviceId.isEmpty()
                 ? service.deviceId : "（连接服务器后显示）"));
         accessibilityView.setText("无障碍：" + (HostInputService.isConnected() ? "已开启" : "未开启（必须开启才能被控制）"));
-        captureView.setText("投屏：" + (HostCaptureService.running ? "进行中" : "未启动（开启被控时授权）"));
+        String captureError = prefs.getString("hostCaptureError", "");
+        if (HostCaptureService.running) {
+            captureView.setText("投屏：进行中");
+        } else if (captureError != null && !captureError.isEmpty()) {
+            captureView.setText("投屏：启动失败 - " + captureError);
+        } else {
+            captureView.setText("投屏：未启动（开启被控时授权）");
+        }
         if (Build.VERSION.SDK_INT >= 30) {
             fileAccessView.setText("文件访问：" + (Environment.isExternalStorageManager()
                     ? "已授权全部文件" : "未授权（接收文件仅限「下载/CrossDesk」目录）"));

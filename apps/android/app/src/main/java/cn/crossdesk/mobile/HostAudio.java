@@ -40,19 +40,19 @@ final class HostAudio {
     @SuppressLint("MissingPermission")
     synchronized boolean startSystem(MediaProjection projection, Sink sink) {
         if (running.get() || projection == null || Build.VERSION.SDK_INT < 29) return false;
-        AudioPlaybackCaptureConfiguration config = new AudioPlaybackCaptureConfiguration.Builder(projection)
-                .addMatchingUsage(AudioAttributes.USAGE_MEDIA)
-                .addMatchingUsage(AudioAttributes.USAGE_GAME)
-                .addMatchingUsage(AudioAttributes.USAGE_UNKNOWN)
-                .build();
         AudioRecord built;
         try {
+            AudioPlaybackCaptureConfiguration config = new AudioPlaybackCaptureConfiguration.Builder(projection)
+                    .addMatchingUsage(AudioAttributes.USAGE_MEDIA)
+                    .addMatchingUsage(AudioAttributes.USAGE_GAME)
+                    .addMatchingUsage(AudioAttributes.USAGE_UNKNOWN)
+                    .build();
             built = new AudioRecord.Builder()
                     .setAudioPlaybackCaptureConfig(config)
                     .setAudioFormat(format())
                     .setBufferSizeInBytes(FRAME_BYTES * 8)
                     .build();
-        } catch (IllegalArgumentException | UnsupportedOperationException error) {
+        } catch (IllegalArgumentException | UnsupportedOperationException | SecurityException error) {
             return false;
         }
         return start(built, sink);
