@@ -36,7 +36,7 @@ import java.util.List;
  * turned into text inserted into the focused editable node, which is the
  * only text path the accessibility API offers.
  */
-final class HostInputService extends AccessibilityService {
+public final class HostInputService extends AccessibilityService {
     static volatile HostInputService instance;
 
     private HandlerThread thread;

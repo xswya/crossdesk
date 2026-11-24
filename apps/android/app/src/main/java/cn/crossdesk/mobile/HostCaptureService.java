@@ -38,7 +38,7 @@ import java.nio.ByteBuffer;
  * preference and stops the service instead of crashing the whole app, so
  * the host panel can show what went wrong on devices without adb access.
  */
-final class HostCaptureService extends Service {
+public final class HostCaptureService extends Service {
     static final String EXTRA_RESULT_CODE = "resultCode";
     static final String EXTRA_DATA = "data";
     private static final String CHANNEL_ID = "crossdesk_host_capture";

@@ -37,7 +37,7 @@ import java.util.concurrent.CopyOnWriteArraySet;
  * executed by HostInputService (accessibility). This service is the hub
  * between them and the native peer.
  */
-final class HostService extends Service implements NativeSession.Listener {
+public final class HostService extends Service implements NativeSession.Listener {
     static final String ACTION_START = "cn.crossdesk.mobile.host.START";
     static final String ACTION_STOP = "cn.crossdesk.mobile.host.STOP";
     static final String ACTION_APPLY_CONFIG = "cn.crossdesk.mobile.host.APPLY_CONFIG";
