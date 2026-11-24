@@ -1,11 +1,16 @@
 package cn.crossdesk.mobile;
 
+import android.Manifest;
 import android.app.Activity;
+import android.content.ComponentName;
 import android.content.Intent;
 import android.content.SharedPreferences;
+import android.content.pm.PackageManager;
 import android.media.projection.MediaProjectionManager;
 import android.net.Uri;
+import android.os.Build;
 import android.os.Bundle;
+import android.os.Environment;
 import android.provider.Settings;
 import android.view.Gravity;
 import android.view.View;
@@ -13,6 +18,7 @@ import android.widget.Button;
 import android.widget.EditText;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
+import android.widget.Switch;
 import android.widget.TextView;
 import java.security.SecureRandom;
 
@@ -26,7 +32,7 @@ public final class HostActivity extends Activity implements HostService.Observer
     private static final int REQUEST_PROJECTION = 7001;
 
     private SharedPreferences prefs;
-    private TextView statusView, idView, accessibilityView, captureView;
+    private TextView statusView, idView, accessibilityView, captureView, fileAccessView;
     private EditText passwordEdit, nameEdit;
 
     @Override protected void onCreate(Bundle state) {
@@ -88,6 +94,22 @@ public final class HostActivity extends Activity implements HostService.Observer
             startActivity(intent);
         });
         root.addView(battery);
+        Button autostart = button("厂商自启动设置（国产平板保活关键）");
+        autostart.setOnClickListener(v -> openVendorAutostart());
+        root.addView(autostart);
+
+        root.addView(text("功能开关", 14, true));
+        root.addView(toggle("允许文件传输（主控可浏览 / 下载 / 上传本机文件）",
+                "hostFileEnabled", true, this::applyConfigToService));
+        root.addView(toggle("系统声音（本机播放的声音传给主控）",
+                "hostSystemAudio", true, this::ensureRecordPermission));
+        root.addView(toggle("麦克风（语音通话：主控能听到本机周围声音）",
+                "hostMic", false, () -> { ensureRecordPermission(); applyConfigToService(); }));
+        Button filesAccess = button("文件访问授权（浏览任意目录需要）");
+        filesAccess.setOnClickListener(v -> openAllFilesAccess());
+        root.addView(filesAccess);
+        fileAccessView = text("", 15, false);
+        root.addView(fileAccessView);
 
         root.addView(text("注意：安卓 14+ 在每次重启或应用进程被杀后，需要重新授权投屏一次；" +
                 "无障碍开启后重启不失效。无人值守部署请同时开启被控并完成投屏授权。", 13, false));
@@ -118,6 +140,73 @@ public final class HostActivity extends Activity implements HostService.Observer
                 ? service.deviceId : "（连接服务器后显示）"));
         accessibilityView.setText("无障碍：" + (HostInputService.isConnected() ? "已开启" : "未开启（必须开启才能被控制）"));
         captureView.setText("投屏：" + (HostCaptureService.running ? "进行中" : "未启动（开启被控时授权）"));
+        if (Build.VERSION.SDK_INT >= 30) {
+            fileAccessView.setText("文件访问：" + (Environment.isExternalStorageManager()
+                    ? "已授权全部文件" : "未授权（接收文件仅限「下载/CrossDesk」目录）"));
+        } else {
+            fileAccessView.setText("文件访问：安卓 10 以下使用存储权限");
+        }
+    }
+
+    private Switch toggle(String label, String key, boolean defaultValue, Runnable after) {
+        Switch view = new Switch(this);
+        view.setText(label);
+        view.setTextSize(14);
+        view.setChecked(prefs.getBoolean(key, defaultValue));
+        view.setOnCheckedChangeListener((button, checked) -> {
+            prefs.edit().putBoolean(key, checked).apply();
+            if (after != null) after.run();
+        });
+        return view;
+    }
+
+    private void applyConfigToService() {
+        if (HostService.isRunning()) {
+            startService(new Intent(this, HostService.class).setAction(HostService.ACTION_APPLY_CONFIG));
+        }
+    }
+
+    private void ensureRecordPermission() {
+        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO}, 7002);
+        }
+    }
+
+    private void openAllFilesAccess() {
+        if (Build.VERSION.SDK_INT >= 30) {
+            try {
+                startActivity(new Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
+                        Uri.parse("package:" + getPackageName())));
+                return;
+            } catch (Exception ignored) { }
+            try {
+                startActivity(new Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION));
+                return;
+            } catch (Exception ignored) { }
+        }
+        startActivity(new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                Uri.parse("package:" + getPackageName())));
+    }
+
+    /** Vendor autostart managers — the make-or-break keep-alive setting on
+     *  Chinese OEM tablets (Xiaomi / OPPO / vivo / Huawei / Samsung). */
+    private void openVendorAutostart() {
+        String[][] vendors = {
+            {"com.miui.securitycenter", "com.miui.permcenter.autostart.AutoStartManagementActivity"},
+            {"com.coloros.safecenter", "com.coloros.safecenter.permission.startup.StartupAppListActivity"},
+            {"com.oppo.safe", "com.oppo.safe.permission.startup.StartupAppListActivity"},
+            {"com.vivo.permissionmanager", "com.vivo.permissionmanager.activity.BgStartUpManagerActivity"},
+            {"com.huawei.systemmanager", "com.huawei.systemmanager.startupmgr.ui.StartupNormalAppListActivity"},
+            {"com.samsung.android.lool", "com.samsung.android.sm.ui.battery.BatteryActivity"},
+        };
+        for (String[] pair : vendors) {
+            try {
+                startActivity(new Intent().setComponent(new ComponentName(pair[0], pair[1])));
+                return;
+            } catch (Exception ignored) { }
+        }
+        startActivity(new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                Uri.parse("package:" + getPackageName())));
     }
 
     private void startHosting() {
