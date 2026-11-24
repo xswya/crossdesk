@@ -798,6 +798,9 @@ public final class MainActivity extends Activity implements NativeSession.Listen
     }
     private void ensureSignaling(){
         if(!foreground||!preferences.getBoolean("networkConsent",false))return;
+        // While host mode is on, HostService owns the device session; a second
+        // identity login from here would fight it over the same device ID.
+        if(preferences.getBoolean("hostMode",false))return;
         if(signaling!=null&&!signaling.isClosed()&&signalingServer.equals(serverKey()))return;
         if(!announcementServer.equals(serverKey())){announcementInbox.reset();announcementServer=serverKey();}
         stopSignaling();signalState=0;signalError="";signalingServer=serverKey();
