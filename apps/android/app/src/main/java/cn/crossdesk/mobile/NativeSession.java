@@ -39,6 +39,14 @@ final class NativeSession implements AutoCloseable {
         default void announcement(JSONObject message) { }
         default void announcementFailed(String requestId) { }
         default void passwordRejected() { ended(L10n.tr("远端密码错误")); }
+        // Host mode (this device is being controlled). Payloads for input and
+        // control are raw RemoteAction JSON strings produced by the native host peer.
+        default void hostSignal(int status) { }
+        default void hostConnected(String remote) { }
+        default void hostDisconnected(int status) { }
+        default void hostAssigned(String assignedId) { }
+        default void hostInput(String actionJson) { }
+        default void hostControl(String actionJson) { }
     }
     // Serializes all peer creation/API calls/destruction, including across activities.
     private static final ExecutorService RTC = Executors.newSingleThreadExecutor(r -> new Thread(r, "CrossDesk RTC"));
@@ -193,6 +201,9 @@ final class NativeSession implements AutoCloseable {
                     publishSignaling(); return;
                 }
                 if (type == 6) { ui(() -> listener.clipboard(value)); return; }
+                if (type == 23) { ui(() -> listener.hostAssigned(value)); return; }
+                if (type == 24) { ui(() -> listener.hostInput(value)); return; }
+                if (type == 25) { ui(() -> listener.hostControl(value)); return; }
                 JSONObject event = new JSONObject(value);
                 if (type == 1) {
                     int status = event.getInt("status");
@@ -244,6 +255,9 @@ final class NativeSession implements AutoCloseable {
                         listener.data(event);
                     });
                 }
+                else if (type == 20) { int status = event.getInt("status"); ui(() -> listener.hostSignal(status)); }
+                else if (type == 21) { String remoteId = event.optString("remote", ""); ui(() -> listener.hostConnected(remoteId)); }
+                else if (type == 22) { int status = event.getInt("status"); ui(() -> listener.hostDisconnected(status)); }
                 else if (type == 5) {
                     int width = event.getInt("width"), height = event.getInt("height");
                     ui(() -> listener.videoSize(width, height));
@@ -297,6 +311,21 @@ final class NativeSession implements AutoCloseable {
         });
     }
     void surface(Surface value) { execute(() -> { surface = value; if (handle != 0) nSurface(handle, value); }); }
+    // ---- Host mode wrappers (this device as the controlled endpoint) ----
+    void hostStart(String login, String name, int width, int height) {
+        execute(() -> { if (handle != 0) nHostStart(handle, login, name, width, height); });
+    }
+    void hostStop() { execute(() -> { if (handle != 0) nHostStop(handle); }); }
+    /** Called directly from the capture thread; the native side throttles and drops. */
+    boolean hostFrame(byte[] rgba, int width, int height, int stride) {
+        if (closed || handle == 0) return false;
+        return nHostFrame(handle, rgba, width, height, stride);
+    }
+    void hostClipboard(String text) {
+        byte[] bytes = text.getBytes(StandardCharsets.UTF_8);
+        if (bytes.length == 0 || bytes.length > MAX_CLIPBOARD_BYTES) return;
+        execute(() -> { if (handle != 0) nHostClipboard(handle, bytes); });
+    }
     void pointer(float x, float y, int flag, int wheel) { execute(() -> { if (connected) nPointer(handle, x, y, flag, wheel); }); }
     void key(int code, boolean down) { execute(() -> { if (connected) nKey(handle, code, down); }); }
     void chord(int code,int[] modifiers) {
@@ -406,4 +435,8 @@ final class NativeSession implements AutoCloseable {
     private static native boolean nPumpFiles(long handle);
     private static native void nSurface(long handle, Surface surface);
     private static native void nDestroy(long handle);
+    private static native boolean nHostStart(long handle, String login, String name, int width, int height);
+    private static native void nHostStop(long handle);
+    private static native boolean nHostFrame(long handle, byte[] rgba, int width, int height, int stride);
+    private static native boolean nHostClipboard(long handle, byte[] data);
 }
