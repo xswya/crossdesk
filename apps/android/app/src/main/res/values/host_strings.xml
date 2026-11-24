@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Host mode strings. Kept separate from strings.xml, which is generated
+     by localization/generate.py and would drop manual entries. -->
+<resources>
+    <string name="host_accessibility_description">CrossDesk 被控：允许经密码授权的远程操作（点击、滑动、输入文字）控制本机</string>
+</resources>
