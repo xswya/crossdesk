@@ -47,6 +47,8 @@ final class NativeSession implements AutoCloseable {
         default void hostAssigned(String assignedId) { }
         default void hostInput(String actionJson) { }
         default void hostControl(String actionJson) { }
+        /** Controller microphone PCM (48 kHz mono s16), real-time thread. */
+        default void hostAudio(byte[] pcm) { }
     }
     // Serializes all peer creation/API calls/destruction, including across activities.
     private static final ExecutorService RTC = Executors.newSingleThreadExecutor(r -> new Thread(r, "CrossDesk RTC"));
@@ -326,6 +328,25 @@ final class NativeSession implements AutoCloseable {
         if (bytes.length == 0 || bytes.length > MAX_CLIPBOARD_BYTES) return;
         execute(() -> { if (handle != 0) nHostClipboard(handle, bytes); });
     }
+    /** One 10 ms PCM frame (960 bytes, 48 kHz mono s16) from the capture thread. */
+    boolean hostAudio(byte[] frame) {
+        if (closed || handle == 0 || frame == null || frame.length != 960) return false;
+        return nHostAudio(handle, frame);
+    }
+    void hostFileDirectory(String directory) {
+        execute(() -> { if (handle != 0) nHostFileDirectory(handle, directory); });
+    }
+    void hostFileEnabled(boolean enabled) {
+        execute(() -> { if (handle != 0) nHostFileEnabled(handle, enabled); });
+    }
+    /** Drives the host file-transfer engine; call periodically while connected. */
+    boolean hostPumpFiles() {
+        if (closed || handle == 0) return false;
+        return nHostPumpFiles(handle);
+    }
+    @SuppressWarnings("unused") private void onHostAudio(byte[] pcm) {
+        if (!closed) listener.hostAudio(pcm);
+    }
     void pointer(float x, float y, int flag, int wheel) { execute(() -> { if (connected) nPointer(handle, x, y, flag, wheel); }); }
     void key(int code, boolean down) { execute(() -> { if (connected) nKey(handle, code, down); }); }
     void chord(int code,int[] modifiers) {
@@ -439,4 +460,8 @@ final class NativeSession implements AutoCloseable {
     private static native void nHostStop(long handle);
     private static native boolean nHostFrame(long handle, byte[] rgba, int width, int height, int stride);
     private static native boolean nHostClipboard(long handle, byte[] data);
+    private static native boolean nHostAudio(long handle, byte[] frame);
+    private static native void nHostFileDirectory(long handle, String directory);
+    private static native void nHostFileEnabled(long handle, boolean enabled);
+    private static native boolean nHostPumpFiles(long handle);
 }
