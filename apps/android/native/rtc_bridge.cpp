@@ -20,6 +20,7 @@
 #include "mobile_direct_connection.h"
 #include "../../../libs/controller/include/mobile_device_trust.h"
 #include "file_transfer_session.h"
+#include "file_browser.h"
 #include "latest_frame_worker.h"
 #include "video_picture.h"
 #include "video_timing.h"
@@ -51,7 +52,7 @@ void RenderVideo(Session* s, VideoPicture picture);
 struct CallbackContext { Session* owner; bool controller; bool host = false; };
 struct Session {
   jobject owner = nullptr;
-  jmethodID event_method, audio_method, frame_method;
+  jmethodID event_method, audio_method, frame_method, host_audio_method;
   mobile_controller::DirectConnection direct;
   MiniRtcPeerPtr* identity = nullptr;
   MiniRtcPeerPtr* controller = nullptr;
@@ -118,6 +119,37 @@ struct Session {
   std::string host_remote;
   std::vector<uint8_t> host_nv12;
   uint64_t host_last_frame_us = 0;
+  // Host-side file transfer: the shared desktop engine (default options —
+  // never delete source files, flat receive directory with name conflicts
+  // resolved by timestamp suffix) plus the file-browser protocol handler,
+  // wired exactly like the desktop host's FileTransferManager adapters.
+  std::atomic<bool> host_file_enabled{true};
+  file_transfer::Session host_files{
+      [this](const char* stream, const char* data, size_t size) {
+        return host_peer && !stopping
+            ? MiniRtcSendReliableDataFrame(host_peer, data, size, stream) : -1;
+      },
+      [this](const std::string& name, double progress, bool sending, const std::string& path) {
+        Event(10, {{"name", name}, {"progress", progress}, {"sending", sending}, {"path", path}});
+      }};
+  FileBrowser host_browser{
+      [this](const std::string&, const FileBrowser::Json& message) {
+        return HostSend(kControlStream,
+            message.dump(-1, ' ', false, FileBrowser::Json::error_handler_t::replace));
+      },
+      [this](const std::string&, const std::string& path, uint32_t id) {
+        const std::filesystem::path file(path);
+        const auto name = file.filename().u8string();
+        return host_files.Start(file, std::string(name.begin(), name.end()),
+                                file_transfer::Session::Clock::now(), id);
+      },
+      [this](const std::string&, uint32_t id, const std::filesystem::path& directory) {
+        return host_files.ReserveDirectory(id, directory);
+      },
+      [this](const std::string&, uint32_t id) {
+        host_files.CancelReceive(id);
+        return true;
+      }};
   bool HostSend(const char* stream, const std::string& data) {
     return host_peer && !stopping && !data.empty() &&
            MiniRtcSendReliableDataFrame(host_peer, data.data(), data.size(), stream) == 0;
@@ -131,6 +163,7 @@ struct Session {
     info.i.supports_text_input = true;
     info.i.supports_video_settings = true;
     info.i.supports_video_codec_status = true;
+    info.i.supports_file_browser = true;
     HostSend(kControlStream, info.to_json());
     FreeRemoteAction(info);
   }
@@ -144,15 +177,48 @@ struct Session {
                status == MiniRtcConnectionDisconnected ||
                status == MiniRtcConnectionFailed) {
       host_connected = false;
-      { std::lock_guard<std::mutex> lock(host_mutex); host_remote.clear(); }
+      std::string remote;
+      { std::lock_guard<std::mutex> lock(host_mutex); remote = host_remote; host_remote.clear(); }
+      host_files.Cancel();
+      if (!remote.empty()) host_browser.Disconnect(remote);
       Event(22, {{"status", static_cast<int>(status)}});
     }
+  }
+  // File-browser requests share the control stream with RemoteAction
+  // messages (same "file_browser" pre-filter the desktop host applies).
+  // Returns true when the payload was a browser message, handled or not.
+  bool HandleHostBrowser(const char* data, size_t size) {
+    if (size > 60000 ||
+        std::string_view(data, size).find("file_browser") == std::string_view::npos)
+      return false;
+    auto message = json::parse(std::string(data, size), nullptr, false);
+    if (!message.is_object() || message.value("type", std::string()) != "file_browser")
+      return false;
+    if (!host_file_enabled.load()) {
+      // Mirror the desktop gate: browsing stays closed until the device
+      // owner enables file transfer in the host panel.
+      if (message.contains("id")) {
+        const json reply{{"op", "reply"}, {"id", message["id"]},
+                         {"type", "file_browser"}, {"version", 1},
+                         {"ok", false}, {"error", "browser_not_open"}};
+        HostSend(kControlStream,
+                 reply.dump(-1, ' ', false, json::error_handler_t::replace));
+      }
+      return true;
+    }
+    std::string remote;
+    { std::lock_guard<std::mutex> lock(host_mutex); remote = host_remote; }
+    host_browser.Handle(remote, std::move(message));
+    return true;
   }
   void OnHostData(const char* data, size_t size, const char* stream, size_t stream_size) {
     const std::string name(stream, stream_size);
     if (name == kClipboardStream) { Event(6, data, size); return; }
     if (name == kMouseStream || name == kKeyboardStream) { Event(24, data, size); return; }
-    if (name != kControlStream) return;  // File transfer to the host is not wired up yet.
+    if (name == kFileStream) { host_files.Receive(data, size); return; }
+    if (name == kFileFeedbackStream) { host_files.Ack(data, size); return; }
+    if (name != kControlStream) return;
+    if (HandleHostBrowser(data, size)) return;
     RemoteAction action{};
     if (!action.from_json(std::string(data, size))) return;
     if (action.type == video_settings) {
@@ -300,6 +366,20 @@ void Audio(const char* data, size_t size, const char*, size_t,
            const char*, size_t, void* user) {
   auto* ctx = static_cast<CallbackContext*>(user);
   auto* s = ctx->owner;
+  if (ctx->host) {
+    // Voice-call downlink: the controller's microphone audio, played by the
+    // Java host service. Same PCM contract as the controller receive path.
+    if (s->stopping || !data || !size || size > 23040 || !s->host_audio_method) return;
+    Environment scope;
+    if (!scope.env) return;
+    auto bytes = scope.env->NewByteArray(size);
+    if (!bytes) return;
+    scope.env->SetByteArrayRegion(bytes, 0, size, reinterpret_cast<const jbyte*>(data));
+    scope.env->CallVoidMethod(s->owner, s->host_audio_method, bytes);
+    scope.env->DeleteLocalRef(bytes);
+    if (scope.env->ExceptionCheck()) scope.env->ExceptionClear();
+    return;
+  }
   if (!ctx->controller || s->stopping || !data || !size || size > 23040) return;
   Environment scope;
   if (!scope.env) return;
@@ -452,6 +532,7 @@ extern "C" JNIEXPORT jlong JNICALL JNI_METHOD(nCreate)(
     auto cls = env->GetObjectClass(owner);
     s->event_method = env->GetMethodID(cls, "onNativeEvent", "(I[B)V");
     s->audio_method = env->GetMethodID(cls, "onNativeAudio", "([B)V");
+    s->host_audio_method = env->GetMethodID(cls, "onHostAudio", "([B)V");
     s->frame_method = env->GetMethodID(cls, "onNativeVideoFrame", "(JDII)V");
     env->DeleteLocalRef(cls);
     s->host = String(env, host); s->port = port;
@@ -733,5 +814,32 @@ extern "C" JNIEXPORT jboolean JNICALL JNI_METHOD(nHostClipboard)(
   env->GetByteArrayRegion(data, 0, size, reinterpret_cast<jbyte*>(bytes.data()));
   if (env->ExceptionCheck() || bytes.find('\0') != std::string::npos) return false;
   return s->HostSend(kClipboardStream, bytes);
+}
+extern "C" JNIEXPORT jboolean JNICALL JNI_METHOD(nHostAudio)(
+    JNIEnv* env, jclass, jlong handle, jbyteArray frame) {
+  auto* s = From(handle);
+  if (!s || !s->host_peer || s->stopping || !frame) return false;
+  const auto size = env->GetArrayLength(frame);
+  if (size != 960) return false;  // 10 ms of 48 kHz mono s16 PCM.
+  std::array<char, 960> pcm{};
+  env->GetByteArrayRegion(frame, 0, size, reinterpret_cast<jbyte*>(pcm.data()));
+  if (env->ExceptionCheck()) return false;
+  MiniRtcAudioFrame audio{pcm.data(), pcm.size(),
+      static_cast<uint64_t>(MiniRtcGetSystemTimeMicros(s->host_peer))};
+  return MiniRtcSendAudioFrame(s->host_peer, &audio, kAudioStream) == 0;
+}
+extern "C" JNIEXPORT void JNICALL JNI_METHOD(nHostFileDirectory)(
+    JNIEnv* env, jclass, jlong handle, jstring directory) {
+  auto* s = From(handle); if (s) s->host_files.SetDirectory(String(env, directory));
+}
+extern "C" JNIEXPORT void JNICALL JNI_METHOD(nHostFileEnabled)(
+    JNIEnv*, jclass, jlong handle, jboolean enabled) {
+  auto* s = From(handle); if (s) s->host_file_enabled = enabled;
+}
+extern "C" JNIEXPORT jboolean JNICALL JNI_METHOD(nHostPumpFiles)(JNIEnv*, jclass, jlong handle) {
+  auto* s = From(handle);
+  if (!s || s->stopping) return false;
+  s->host_files.Pump();
+  return s->host_files.Sending();
 }
 extern "C" JNIEXPORT void JNICALL JNI_METHOD(nDestroy)(JNIEnv*, jclass, jlong handle) { delete From(handle); }
