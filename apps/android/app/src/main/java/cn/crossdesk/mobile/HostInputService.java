@@ -5,6 +5,7 @@ import android.accessibilityservice.GestureDescription;
 import android.content.ClipData;
 import android.content.ClipboardManager;
 import android.content.Context;
+import android.content.Intent;
 import android.graphics.Path;
 import android.graphics.Point;
 import android.graphics.PointF;
@@ -64,6 +65,15 @@ final class HostInputService extends AccessibilityService {
         thread.start();
         handler = new Handler(thread.getLooper());
         refreshScreenSize();
+        // Keep-alive anchor: the system holds accessibility bindings far
+        // longer than ordinary processes, so a (re)connect here revives the
+        // host service after the process was reaped (the RustDesk pattern).
+        if (BootReceiver.hostModeEnabled(this) && !HostService.isRunning()) {
+            try {
+                startForegroundService(new Intent(this, HostService.class)
+                        .setAction(HostService.ACTION_START));
+            } catch (Exception ignored) { }
+        }
     }
 
     @Override public void onDestroy() {
