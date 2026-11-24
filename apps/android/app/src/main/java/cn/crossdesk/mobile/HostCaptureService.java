@@ -45,6 +45,7 @@ final class HostCaptureService extends Service {
     private MediaProjection projection;
     private VirtualDisplay virtualDisplay;
     private ImageReader reader;
+    private final HostAudio systemAudio = new HostAudio();
     private HandlerThread thread;
     private Handler handler;
     private long lastFrameMs;
@@ -104,7 +105,22 @@ final class HostCaptureService extends Service {
                 DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
                 reader.getSurface(), null, handler);
         running = true;
+        startSystemAudio();
         return START_STICKY;
+    }
+
+    /**
+     * System-audio capture rides the same MediaProjection consent
+     * (AudioPlaybackCapture, Android 10+). Frames flow to the host peer via
+     * HostService, which drops them while the voice-call microphone is live.
+     */
+    private void startSystemAudio() {
+        boolean enabled = getSharedPreferences("settings", MODE_PRIVATE)
+                .getBoolean("hostSystemAudio", true);
+        boolean granted = checkSelfPermission(android.Manifest.permission.RECORD_AUDIO)
+                == android.content.pm.PackageManager.PERMISSION_GRANTED;
+        if (!enabled || !granted) return;
+        systemAudio.startSystem(projection, HostService::pushAudioFrame);
     }
 
     private void onImage(ImageReader imageReader) {
@@ -150,6 +166,7 @@ final class HostCaptureService extends Service {
 
     @Override public void onDestroy() {
         running = false;
+        systemAudio.stop();
         if (virtualDisplay != null) virtualDisplay.release();
         if (reader != null) reader.close();
         if (projection != null) projection.stop();

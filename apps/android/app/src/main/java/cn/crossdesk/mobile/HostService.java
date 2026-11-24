@@ -13,10 +13,12 @@ import android.content.SharedPreferences;
 import android.content.pm.ServiceInfo;
 import android.graphics.Point;
 import android.os.Build;
+import android.os.Environment;
 import android.os.Handler;
 import android.os.IBinder;
 import android.os.Looper;
 import android.os.PowerManager;
+import java.io.File;
 import android.view.Display;
 import android.view.WindowManager;
 import org.json.JSONObject;
@@ -38,6 +40,7 @@ import java.util.concurrent.CopyOnWriteArraySet;
 final class HostService extends Service implements NativeSession.Listener {
     static final String ACTION_START = "cn.crossdesk.mobile.host.START";
     static final String ACTION_STOP = "cn.crossdesk.mobile.host.STOP";
+    static final String ACTION_APPLY_CONFIG = "cn.crossdesk.mobile.host.APPLY_CONFIG";
     private static final String CHANNEL_ID = "crossdesk_host";
     private static final int NOTIFICATION_ID = 4201;
     private static final long RESTART_DELAY_MS = 10_000;
@@ -45,6 +48,9 @@ final class HostService extends Service implements NativeSession.Listener {
     interface Observer { void onHostStateChanged(); }
     static final Set<Observer> observers = new CopyOnWriteArraySet<>();
     static volatile HostService instance;
+    private static volatile boolean runningFlag;
+
+    static boolean isRunning() { return runningFlag; }
 
     volatile String deviceId = "";
     volatile String statusText = "未启动";
@@ -56,6 +62,11 @@ final class HostService extends Service implements NativeSession.Listener {
     private NativeSession session;
     private PowerManager.WakeLock wakeLock;
     private int restartAttempts;
+    private AudioPlayer audioPlayer;
+    private final HostAudio micAudio = new HostAudio();
+    private Thread pumpThread;
+    private volatile boolean pumpActive;
+    private int lastFilePercent = -1;
 
     static void addObserver(Observer observer) { observers.add(observer); }
     static void removeObserver(Observer observer) { observers.remove(observer); }
@@ -68,9 +79,21 @@ final class HostService extends Service implements NativeSession.Listener {
         return service.session.hostFrame(rgba, width, height, stride);
     }
 
+    /**
+     * System-audio entry point used by HostCaptureService. The microphone,
+     * when enabled for a voice call, takes precedence over system audio.
+     */
+    static boolean pushAudioFrame(byte[] frame) {
+        HostService service = instance;
+        if (service == null || service.session == null || service.connectedRemote.isEmpty()) return false;
+        if (service.micAudio.isRunning()) return false;
+        return service.session.hostAudio(frame);
+    }
+
     @Override public void onCreate() {
         super.onCreate();
         instance = this;
+        runningFlag = true;
         NotificationManager manager = getSystemService(NotificationManager.class);
         if (manager != null) {
             manager.createNotificationChannel(new NotificationChannel(
@@ -95,10 +118,81 @@ final class HostService extends Service implements NativeSession.Listener {
             stopHosting();
             return START_NOT_STICKY;
         }
+        BootReceiver.scheduleWatchdog(this);
+        if (ACTION_APPLY_CONFIG.equals(action)) {
+            applyConfig();
+            return START_STICKY;
+        }
         startRequested = true;
         if (session == null) openSession();
         updateStatus(hostPeerStarted ? "被控已开启" : "正在连接服务器…");
         return START_STICKY;
+    }
+
+    /** Re-applies panel toggles (file transfer, microphone) to the live session. */
+    private void applyConfig() {
+        SharedPreferences prefs = getSharedPreferences("settings", MODE_PRIVATE);
+        if (session != null) session.hostFileEnabled(prefs.getBoolean("hostFileEnabled", true));
+        applyMic(prefs);
+    }
+
+    private void applyMic(SharedPreferences prefs) {
+        boolean want = prefs.getBoolean("hostMic", false)
+                && !connectedRemote.isEmpty() && hasRecordPermission();
+        if (want && !micAudio.isRunning()) {
+            micAudio.startMic(frame -> {
+                NativeSession current = session;
+                if (current != null) current.hostAudio(frame);
+            });
+        } else if (!want && micAudio.isRunning()) {
+            micAudio.stop();
+        }
+    }
+
+    private boolean hasRecordPermission() {
+        return checkSelfPermission(android.Manifest.permission.RECORD_AUDIO)
+                == android.content.pm.PackageManager.PERMISSION_GRANTED;
+    }
+
+    /** Directory that receives files sent to this device: Downloads/CrossDesk. */
+    private String receiveDirectory() {
+        File downloads = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS);
+        File dir = new File(downloads, "CrossDesk");
+        if (!dir.exists()) dir.mkdirs();
+        return dir.getAbsolutePath();
+    }
+
+    private void startFilePump() {
+        stopFilePump();
+        pumpActive = true;
+        pumpThread = new Thread(() -> {
+            while (pumpActive) {
+                NativeSession current = session;
+                if (current == null) break;
+                current.hostPumpFiles();
+                try { Thread.sleep(15); } catch (InterruptedException error) { break; }
+            }
+        }, "CrossDesk host file pump");
+        pumpThread.start();
+    }
+
+    private void stopFilePump() {
+        pumpActive = false;
+        Thread worker = pumpThread;
+        pumpThread = null;
+        if (worker != null) {
+            worker.interrupt();
+            try { worker.join(300); } catch (InterruptedException ignored) { }
+        }
+    }
+
+    private void startAudioPlayer() {
+        stopAudioPlayer();
+        audioPlayer = new AudioPlayer();
+    }
+
+    private void stopAudioPlayer() {
+        if (audioPlayer != null) { audioPlayer.close(); audioPlayer = null; }
     }
 
     private void openSession() {
@@ -110,6 +204,9 @@ final class HostService extends Service implements NativeSession.Listener {
     }
 
     private void closeSession() {
+        stopFilePump();
+        micAudio.stop();
+        stopAudioPlayer();
         if (session != null) {
             try { session.hostStop(); } catch (Exception ignored) { }
             session.close();
@@ -126,11 +223,22 @@ final class HostService extends Service implements NativeSession.Listener {
         stopSelf();
     }
 
+    @Override public void onTaskRemoved(Intent rootIntent) {
+        // Swiped away from recents: come back unless the user stopped hosting.
+        if (BootReceiver.hostModeEnabled(this)) BootReceiver.scheduleRestart(this);
+        super.onTaskRemoved(rootIntent);
+    }
+
     @Override public void onDestroy() {
+        boolean revive = BootReceiver.hostModeEnabled(this);
         startRequested = false;
         closeSession();
         if (wakeLock != null && wakeLock.isHeld()) wakeLock.release();
         if (instance == this) instance = null;
+        runningFlag = false;
+        // An intentional stop clears hostMode first (stopHosting), so reaching
+        // here with hostMode still on means the system killed us: revive.
+        if (revive) BootReceiver.scheduleRestart(this);
         super.onDestroy();
     }
 
@@ -170,6 +278,8 @@ final class HostService extends Service implements NativeSession.Listener {
         if (name == null || name.isEmpty()) name = Build.MODEL;
         Point size = realDisplaySize();
         session.hostStart(deviceId + "@" + passcode, name, size.x, size.y);
+        session.hostFileDirectory(receiveDirectory());
+        session.hostFileEnabled(prefs.getBoolean("hostFileEnabled", true));
         hostPeerStarted = true;
         restartAttempts = 0;
         updateStatus("被控已开启，等待连接");
@@ -215,11 +325,40 @@ final class HostService extends Service implements NativeSession.Listener {
     @Override public void hostConnected(String remote) {
         connectedRemote = remote;
         updateStatus("主控已连接：" + remote);
+        startAudioPlayer();
+        startFilePump();
+        applyMic(getSharedPreferences("settings", MODE_PRIVATE));
     }
 
     @Override public void hostDisconnected(int status) {
         connectedRemote = "";
+        stopFilePump();
+        micAudio.stop();
+        stopAudioPlayer();
         updateStatus("主控已断开，等待连接");
+    }
+
+    @Override public void hostAudio(byte[] pcm) {
+        AudioPlayer player = audioPlayer;
+        if (player != null) player.offer(pcm);
+    }
+
+    @Override public void fileTransfer(String name, double progress, boolean sending, File received) {
+        if (progress < 0) {
+            lastFilePercent = -1;
+            updateStatus("文件传输失败：" + name);
+            return;
+        }
+        if (progress >= 1) {
+            lastFilePercent = -1;
+            updateStatus(sending ? "文件已发送：" + name : "文件已接收：" + name);
+            return;
+        }
+        int percent = (int) Math.round(progress * 100);
+        if (percent != lastFilePercent && percent % 5 == 0) {
+            lastFilePercent = percent;
+            updateStatus((sending ? "正在发送 " : "正在接收 ") + name + " · " + percent + "%");
+        }
     }
 
     @Override public void hostInput(String actionJson) {
